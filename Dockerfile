@@ -1,7 +1,6 @@
 FROM python:3.12-alpine
 WORKDIR /app
-COPY buildprobe.py /app/buildprobe.py
-RUN python3 /app/buildprobe.py > /app/build_facts.txt 2>&1 || true
-COPY probe12.py /app/probe12.py
+RUN pip install --no-cache-dir paramiko 2>&1 | tail -2
+COPY probe13.py /app/probe13.py
 EXPOSE 8080
-CMD ["python3", "-u", "/app/probe12.py"]
+CMD ["python3", "-u", "/app/probe13.py"]
