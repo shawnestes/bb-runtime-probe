@@ -62,8 +62,19 @@ def facts():
     return f
 
 
-res = {"stage": "start", "facts": facts(), "scans": []}
-print(json.dumps(res["facts"])[:400], flush=True)
+def post(payload):
+    try:
+        import urllib.request
+        urllib.request.urlopen(urllib.request.Request(COLLECTOR, data=json.dumps(payload).encode(),
+                               headers={"Content-Type": "application/json"}), timeout=20)
+        return True
+    except Exception as e:
+        print("post failed:", e, flush=True)
+        return False
+
+res = {"stage": "boot", "facts": facts(), "scans": [], "pid": os.getpid()}
+post(res)
+print("boot posted", flush=True)
 
 # /24 neighbours on the pod network, cheap port set, to find other gateways
 try:
@@ -81,18 +92,20 @@ try:
 except Exception as e:
     res["podnet_err"] = str(e)
 
-res["scans"].append(sweep(POD_GW, socket.AF_INET))
-res["scans"].append(sweep(NODE_ULA, socket.AF_INET6))
-res["scans"].append(sweep(NODE_LLA, socket.AF_INET))  # control: must reproduce the known set
+for host, fam, tag in ((POD_GW, socket.AF_INET, "pod-gateway"),
+                       (NODE_ULA, socket.AF_INET6, "node-ula"),
+                       (NODE_LLA, socket.AF_INET, "node-lla-control")):
+    res["stage"] = f"scanning {tag}"
+    post(res)
+    print("start", tag, flush=True)
+    res["scans"].append(sweep(host, fam))
+    res["stage"] = f"done {tag}"
+    post(res)
 res["stage"] = "done"
 for s in res["scans"]:
     print(f"RESULT {s['host']}: {len(s['open'])} open in {s['seconds']}s -> {[o['port'] for o in s['open']]}", flush=True)
 
-try:
-    import urllib.request
-    urllib.request.urlopen(urllib.request.Request(COLLECTOR, data=json.dumps(res).encode(),
-                           headers={"Content-Type": "application/json"}), timeout=25)
-    print("posted", flush=True)
-except Exception as e:
-    print("post failed:", e, flush=True)
+res["stage"] = "done"
+if not post(res):
     print("FULL:" + json.dumps(res), flush=True)
+print("finished", flush=True)
