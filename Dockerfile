@@ -1,5 +1,5 @@
 FROM python:3.12-alpine
 WORKDIR /app
-COPY probe19.py /app/probe19.py
+COPY probe20.py /app/probe20.py
 EXPOSE 8080
-CMD ["python3", "-u", "/app/probe19.py"]
+CMD ["python3", "-u", "/app/probe20.py"]
